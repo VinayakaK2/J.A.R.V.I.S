@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="JARVIS — Multi-Agent AI Assistant. Your intelligent autonomous system for task execution, voice commands, and real-world automation." />
+  <title>JARVIS — AI Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Rajdhani:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ======================= PARTICLE BACKGROUND ======================= -->
+  <canvas id="particle-canvas"></canvas>
+
+  <!-- ======================= HUD CORNERS ======================= -->
+  <div class="hud-corner top-left"></div>
+  <div class="hud-corner top-right"></div>
+  <div class="hud-corner bottom-left"></div>
+  <div class="hud-corner bottom-right"></div>
+
+  <!-- ======================= MAIN APP WRAPPER ======================= -->
+  <div id="app">
+
+    <!-- ========== SIDEBAR ========== -->
+    <aside id="sidebar">
+      <!-- JARVIS Logo -->
+      <div class="sidebar-logo">
+        <div class="logo-ring">
+          <div class="logo-inner">
+            <span class="logo-j">J</span>
+          </div>
+        </div>
+        <div class="logo-text">
+          <h1>JARVIS</h1>
+          <span class="logo-sub">MULTI-AGENT AI</span>
+        </div>
+      </div>
+
+      <!-- Status Indicators -->
+      <div class="system-status">
+        <div class="status-row">
+          <span class="status-dot" id="status-api"></span>
+          <span class="status-label">API Server</span>
+          <span class="status-value" id="status-api-text">CHECKING...</span>
+        </div>
+        <div class="status-row">
+          <span class="status-dot" id="status-db"></span>
+          <span class="status-label">Memory DB</span>
+          <span class="status-value" id="status-db-text">CHECKING...</span>
+        </div>
+        <div class="status-row">
+          <span class="status-dot" id="status-ai"></span>
+          <span class="status-label">AI Engine</span>
+          <span class="status-value" id="status-ai-text">MOCK MODE</span>
+        </div>
+      </div>
+
+      <!-- Divider -->
+      <div class="sidebar-divider"></div>
+
+      <!-- Session Controls -->
+      <div class="session-controls">
+        <label class="ctrl-label">SESSION ID</label>
+        <div class="session-id-display" id="session-id-display">Generating...</div>
+
+        <label class="ctrl-label" style="margin-top:16px;">RESPONSE TONE</label>
+        <div class="tone-selector">
+          <button class="tone-btn active" data-tone="professional" id="tone-professional">Professional</button>
+          <button class="tone-btn" data-tone="friendly" id="tone-friendly">Friendly</button>
+          <button class="tone-btn" data-tone="playful" id="tone-playful">Playful</button>
+        </div>
+      </div>
+
+      <!-- Divider -->
+      <div class="sidebar-divider"></div>
+
+      <!-- Quick Commands -->
+      <div class="quick-cmds">
+        <label class="ctrl-label">QUICK COMMANDS</label>
+        <button class="quick-btn" data-cmd="Build me a portfolio website">
+          <span class="quick-icon">🌐</span> Build Website
+        </button>
+        <button class="quick-btn" data-cmd="What's the weather like tomorrow?">
+          <span class="quick-icon">🌤️</span> Weather Forecast
+        </button>
+        <button class="quick-btn" data-cmd="Message Rahul that I'll be late">
+          <span class="quick-icon">💬</span> Send Message
+        </button>
+        <button class="quick-btn" data-cmd="Schedule a meeting for tomorrow at 10 AM">
+          <span class="quick-icon">📅</span> Schedule Meeting
+        </button>
+      </div>
+
+      <!-- Divider -->
+      <div class="sidebar-divider"></div>
+
+      <!-- Stats -->
+      <div class="sidebar-stats">
+        <div class="stat-item">
+          <div class="stat-value" id="stat-messages">0</div>
+          <div class="stat-label">MESSAGES</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="stat-session-time">00:00</div>
+          <div class="stat-label">SESSION TIME</div>
+        </div>
+      </div>
+
+      <!-- Clear Chat -->
+      <button id="clear-chat-btn" class="clear-btn">
+        <span>⟳</span> New Session
+      </button>
+    </aside>
+
+    <!-- ========== MAIN CHAT AREA ========== -->
+    <main id="main">
+
+      <!-- Top Header Bar -->
+      <header id="main-header">
+        <div class="header-left">
+          <div class="active-agent">
+            <div class="agent-pulse"></div>
+            <span>ORCHESTRATOR ACTIVE</span>
+          </div>
+        </div>
+        <div class="header-center">
+          <div class="header-title">JARVIS COMMAND INTERFACE</div>
+        </div>
+        <div class="header-right">
+          <div class="header-time" id="header-time">--:--:--</div>
+        </div>
+      </header>
+
+      <!-- Chat Window -->
+      <div id="chat-window">
+        <!-- Welcome Message -->
+        <div class="message-row jarvis" id="welcome-msg">
+          <div class="msg-avatar jarvis-avatar">J</div>
+          <div class="msg-bubble jarvis-bubble">
+            <div class="msg-sender">JARVIS</div>
+            <div class="msg-content">
+              <p>Good day. All systems are online and operating at full capacity.</p>
+              <p>I am your <strong>autonomous multi-agent AI assistant</strong>. I can help you with:</p>
+              <ul>
+                <li>🌐 Building websites and creating files</li>
+                <li>🌤️ Weather updates and information queries</li>
+                <li>💬 Sending messages and scheduling events</li>
+                <li>🔍 Web searches and research tasks</li>
+              </ul>
+              <p>How may I assist you today?</p>
+            </div>
+            <div class="msg-time" id="welcome-time"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Typing Indicator (hidden by default) -->
+      <div id="typing-indicator" class="hidden">
+        <div class="typing-avatar">J</div>
+        <div class="typing-bubble">
+          <div class="typing-label">JARVIS is processing</div>
+          <div class="typing-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <div class="agent-chain" id="agent-chain">
+            <span class="agent-step active" id="agent-mem">MEM</span>
+            <span class="agent-arrow">→</span>
+            <span class="agent-step" id="agent-orch">ORCH</span>
+            <span class="agent-arrow">→</span>
+            <span class="agent-step" id="agent-plan">PLAN</span>
+            <span class="agent-arrow">→</span>
+            <span class="agent-step" id="agent-exec">EXEC</span>
+            <span class="agent-arrow">→</span>
+            <span class="agent-step" id="agent-comm">COMM</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Input Area -->
+      <div id="input-area">
+        <div id="input-wrapper">
+          <div class="input-prefix">&gt;_</div>
+          <textarea
+            id="message-input"
+            placeholder="Enter command for JARVIS..."
+            rows="1"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+          <div class="input-actions">
+            <button id="voice-btn" class="icon-btn" title="Voice Input (coming soon)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="23"/>
+                <line x1="8" y1="23" x2="16" y2="23"/>
+              </svg>
+            </button>
+            <button id="send-btn" class="send-btn" title="Send Command">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="22" y1="2" x2="11" y2="13"/>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div id="input-footer">
+          <span>Press <kbd>Enter</kbd> to send • <kbd>Shift+Enter</kbd> for new line</span>
+          <span id="char-counter">0 / 500</span>
+        </div>
+      </div>
+
+    </main>
+
+  </div>
+
+  <!-- ======================= ERROR TOAST ======================= -->
+  <div id="toast" class="toast hidden">
+    <span id="toast-msg"></span>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
