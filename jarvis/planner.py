@@ -26,6 +26,10 @@ class Plan(BaseModel):
     plan_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     goal: str
     steps: List[PlanStep]
+    # Workflow learning meta-data tracking
+    is_learned_workflow: bool = False
+    workflow_confidence: float = 0.0
+    workflow_sequence: str = ""
 
 
 # ─── Planner Agent ─────────────────────────────────────────────────────────────
@@ -97,7 +101,13 @@ Required JSON format:
             return None
 
     # Main entry point: produce a validated Plan from user intent
-    def create_plan(self, user_intent: str, context: Optional[str] = None) -> Optional[Plan]:
+    def create_plan(self, user_intent: str, context: Optional[str] = None, session_id: str = "unknown") -> Optional[Plan]:
+        from learning.event_logger import workflow_logger
+        from learning.workflows import match_workflow
+
+        # Log Task Initialization Lifecycle phase
+        workflow_logger.log_task_start(session_id, user_intent, user_intent)
+
         if not self.llm_enabled:
             return self._mock_plan(user_intent)
 
@@ -115,11 +125,58 @@ Required JSON format:
         messages = [SystemMessage(content=self._build_system_prompt())]
         if context:
             messages.append(SystemMessage(content=f"User context:\n{context}"))
+
+        # ── Workflow Injection (adaptive guidance, not rigid copy) ─────────────
+        # match_workflow now returns a bundle: {workflow, confidence, semantic_similarity, mode}
+        match_result = match_workflow(user_intent, context)
+        is_learned = False
+        conf = 0.0
+        seq_str = ""
+
+        if match_result and match_result.get("mode") in ("auto", "ask"):
+            is_learned = True
+            w = match_result["workflow"]
+            conf = match_result["confidence"]
+            sem_sim = match_result["semantic_similarity"]
+
+            # Build a human-readable parameterized step summary for the LLM
+            step_hints = []
+            for s in w.get("steps", []):
+                tool = s["tool"]
+                template = s.get("params_template", {})
+                hint = tool
+                if template:
+                    hint += f" (params: {', '.join(template.keys())})"
+                step_hints.append(hint)
+            seq_str = " -> ".join([s["tool"] for s in w.get("steps", [])])
+
+            # Adaptive prompt: guide the planner without forcing exact copies
+            # The LLM is told it CAN modify, add, or skip steps as needed.
+            workflow_prompt = (
+                f"LEARNED WORKFLOW SUGGESTION (confidence={conf:.2f}, semantic_similarity={sem_sim:.2f}):\n"
+                f"Suggested tool sequence: {' -> '.join(step_hints)}\n"
+                f"INSTRUCTIONS: Use this as a starting template. You MAY:\n"
+                f"  - Adapt parameter values to match the current request context.\n"
+                f"  - Add steps that are clearly missing for correctness.\n"
+                f"  - Remove steps that are not relevant to this specific request.\n"
+                f"  - Reorder steps if that produces a better outcome.\n"
+                f"Do NOT copy blindly. This is a guide, not a script."
+            )
+            messages.append(SystemMessage(content=workflow_prompt))
+
         messages.append(HumanMessage(content=user_intent))
 
         try:
             response = llm.invoke(messages)
-            return self._parse_plan(response.content, goal=user_intent)
+            plan = self._parse_plan(response.content, goal=user_intent)
+            if plan:
+                plan.is_learned_workflow = is_learned
+                plan.workflow_confidence = conf
+                plan.workflow_sequence = seq_str
+
+                # Log plan generation Lifecycle phase
+                workflow_logger.log_plan_generated(session_id, user_intent, [s.dict() for s in plan.steps])
+            return plan
         except Exception as e:
             logger.error(f"[Planner] LLM call failed: {e}")
             return None

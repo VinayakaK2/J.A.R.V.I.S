@@ -12,6 +12,10 @@ from rq import Queue
 from redis import Redis
 import os
 
+from background.activity_monitor import ActivityMonitor
+from background.context_analyzer import ContextAnalyzer
+from background.trigger_engine import TriggerEngine
+
 logger = logging.getLogger(__name__)
 redis_conn = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/"))
 task_queue = Queue("jarvis_tasks", connection=redis_conn)
@@ -33,16 +37,24 @@ def execute_deferred_task(session_id: str, tool: str, params: Dict[str, Any], ta
     return wrapped_execute()
 
 class BackgroundAgent:
-    def __init__(self, poll_interval: int = 10):
+    def __init__(self, poll_interval: int = 5):
         self.poll_interval = poll_interval
         self._running = False
         self.memory = MemoryAgent()
+        
+        # Proactive Assistant Components
+        self.monitor = ActivityMonitor()
+        self.analyzer = ContextAnalyzer()
+        self.trigger_engine = TriggerEngine(cooldown_seconds=600)
 
     async def run(self) -> None:
         self._running = True
         logger.info(f"[BackgroundAgent] Started Goal-Autonomy loop. Polling every {self.poll_interval}s.")
         while self._running:
             try:
+                # ── Proactive AI Interaction ──
+                self._process_proactive_context()
+                
                 # ── Goal Based Autonomy ──
                 self._process_active_goals()
                 
@@ -56,6 +68,32 @@ class BackgroundAgent:
                 logger.error(f"[BackgroundAgent] Unhandled error: {exc}")
 
             await asyncio.sleep(self.poll_interval)
+
+    def _process_proactive_context(self):
+        """Observe OS, analyze context, and decide whether to interrupt the user."""
+        try:
+            activity = self.monitor.get_current_activity()
+            context = self.analyzer.analyze(activity, self.memory)
+            trigger = self.trigger_engine.evaluate(context)
+
+            if trigger.get("should_trigger"):
+                self._deliver_proactive_message(trigger["message_hint"])
+        except Exception as e:
+            logger.debug(f"[BackgroundAgent] Error in proactive context loop: {e}")
+
+    def _deliver_proactive_message(self, message: str):
+        """Push notification to the OS desktop."""
+        logger.info(f"[BackgroundAgent] Proactive Alert: {message}")
+        try:
+            from plyer import notification
+            notification.notify(
+                title="JARVIS",
+                message=message,
+                app_name="JARVIS Proactive Assistant",
+                timeout=10
+            )
+        except Exception as e:
+            logger.debug(f"[BackgroundAgent] Notification delivery failed (plyer missing or headless OS): {e}")
 
     def _process_active_goals(self):
         """Monitors continuous goals and creates plans periodically independent of users"""
@@ -112,4 +150,5 @@ class BackgroundAgent:
     def stop(self) -> None:
         self._running = False
 
-background_agent = BackgroundAgent(poll_interval=10)
+from config.settings import settings
+background_agent = BackgroundAgent(poll_interval=settings.background_poll_interval)

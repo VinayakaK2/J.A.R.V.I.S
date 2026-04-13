@@ -5,28 +5,33 @@ JARVIS v7 FastAPI application entry point.
 
 New in v7:
   • /webhook/whatsapp  — Twilio WhatsApp inbound messages
-  • /voice             — Twilio Voice TwiML entry (records caller)
-  • /voice/process     — Twilio recordings → Whisper → JARVIS → ElevenLabs → TwiML
-  • /webhook/telegram  — Telegram Bot webhook (via integration/telegram.py)
-  • /static            — StaticFiles mount exposes workspace for Twilio audio playback
-  • app.state          — Shares singleton orchestrator / audio_processor with routers
+  • /voice/incoming    — Twilio Voice TwiML entry (batch mode fallback)
+  • /voice/process     — Batch: recording URL → Whisper → JARVIS → ElevenLabs → TwiML
+  • /ws/voice          — Real-time: Twilio Media Streams WebSocket (NEW v7.1)
+  • /webhook/telegram  — Telegram Bot webhook
+  • /static            — StaticFiles for Twilio audio playback
+  • app.state          — Shared orchestrator / audio_processor singletons
+
+Voice mode selection (set in .env):
+  USE_REALTIME_VOICE=true   → Twilio Media Streams WebSocket (/ws/voice)
+  USE_REALTIME_VOICE=false  → Legacy Record-and-process batch mode
 """
 
 import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import urljoin
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, Form, File, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.websockets import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from config.settings import settings
-from memory.db import init_db, SessionLocal, User
+from memory.db import init_db, SessionLocal, User, AgentStatus, LocalTask, StepResult
 from orchestrator import OrchestratorAgent
 from voice.audio import AudioProcessor
 from background_agent import background_agent
@@ -241,6 +246,186 @@ async def schedule_task(
     }
 
 
+# ─── Hybrid Cloud/Local Execution API (New v7.2) ─────────────────────────────
+
+@app.post("/agent/heartbeat", tags=["Hybrid"])
+async def agent_heartbeat(current_user: User = Depends(get_current_user)):
+    """Local Agent checks in, proving it is online and available for tasks."""
+    if not getattr(current_user, "is_agent", False):
+        raise HTTPException(status_code=403, detail="Not an agent identity")
+        
+    from datetime import datetime
+    agent_id = current_user.bound_agent_id
+    with SessionLocal() as db:
+        status = db.query(AgentStatus).filter(AgentStatus.agent_id == agent_id).first()
+        if not status:
+            status = AgentStatus(user_id=current_user.id, agent_id=agent_id, status="online")
+            db.add(status)
+        else:
+            status.last_heartbeat = datetime.utcnow()
+            status.status = "online"
+        db.commit()
+    return {"status": "ok"}
+
+@app.get("/tasks/poll", tags=["Hybrid"])
+async def poll_local_tasks(current_user: User = Depends(get_current_user)):
+    """Atomically claim the next pending local task."""
+    if not getattr(current_user, "is_agent", False):
+        raise HTTPException(status_code=403, detail="Not an agent identity")
+
+    from datetime import datetime, timedelta
+    from observability.tracer import tracer
+    import json
+    
+    agent_id = current_user.bound_agent_id
+    
+    with SessionLocal() as db:
+        now = datetime.utcnow()
+        
+        # Stalled Task Recovery (Failure Handling)
+        stalled_tasks = db.query(LocalTask).filter(
+            LocalTask.agent_id == agent_id,
+            LocalTask.status == "running",
+            LocalTask.updated_at < now - timedelta(minutes=5)
+        ).all()
+        
+        for st in stalled_tasks:
+            if st.retries < st.max_retries:
+                logger.warning(f"Recovering stalled task {st.id}. Re-queueing.")
+                st.status = "pending"
+                st.retries += 1
+                st.updated_at = now
+                tracer.log_transition(st.request_id, st.plan_id, "running", "pending_retry", st.step_id, str(st.id))
+            else:
+                logger.error(f"Task {st.id} failed after max retries due to agent crash timeout.")
+                st.status = "failed"
+                st.result = "Agent crashed mid-task (timeout)."
+                st.updated_at = now
+                tracer.log_transition(st.request_id, st.plan_id, "running", "failed_timeout", st.step_id, str(st.id))
+                
+                # We should trigger background resume to unblock the plan
+                try:
+                    import os
+                    from rq import Queue
+                    from redis import Redis
+                    redis_conn = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/"))
+                    q = Queue("jarvis_tasks", connection=redis_conn)
+                    q.enqueue(_bg_resume_plan, st.session_id, st.plan_id, current_user.id, st.request_id)
+                except Exception:
+                    pass
+        db.commit()
+
+        # Atomic claim (skip_locked ensures horizontal concurrency if multiple identical agents exist)
+        task = db.query(LocalTask).with_for_update(skip_locked=True).filter(
+            LocalTask.user_id == current_user.id,
+            LocalTask.status == "pending"
+        ).order_by(LocalTask.priority.desc(), LocalTask.created_at.asc()).first()
+            LocalTask.user_id == current_user.id,
+            LocalTask.status == "pending"
+        ).order_by(LocalTask.created_at.asc()).first()
+
+        if not task:
+            db.commit()
+            return {"task": None}
+            
+        task.status = "running"
+        task.agent_id = agent_id
+        task.last_attempt_at = now
+        task.updated_at = now
+        db.commit()
+        
+        tracer.log_transition(task.request_id, task.plan_id, "pending", "running", task.step_id, str(task.id), {"agent_id": agent_id})
+        
+        return {
+            "task": {
+                "id": task.id,
+                "plan_id": task.plan_id,
+                "step_id": task.step_id,
+                "action": task.action,
+                "params": json.loads(task.params),
+                "idempotency_key": task.idempotency_key
+            }
+        }
+
+class TaskResultPayload(BaseModel):
+    task_id: int
+    idempotency_key: str
+    status: str
+    result: str = None
+
+# Background job executed by rq to resume a plan
+def _bg_resume_plan(session_id: str, plan_id: str, user_id: int, request_id: str):
+    from orchestrator import OrchestratorAgent
+    from memory.db import ExecutionState
+    
+    with SessionLocal() as db:
+        es = db.query(ExecutionState).filter_by(plan_id=plan_id).first()
+        if not es:
+            logger.error(f"Cannot resume plan {plan_id} — ExecutionState lost.")
+            return
+            
+        import json
+        completed_ids = json.loads(es.completed_steps)
+        plan_json = es.steps
+        
+    orch = OrchestratorAgent()
+    try:
+        from observability.tracer import tracer
+        tracer.log_transition(request_id, plan_id, "waiting_for_local", "resuming")
+        orch.resume_plan(session_id, plan_json, completed_ids)
+    except Exception as e:
+        logger.exception(f"[Background Resume] Error resuming plan: {e}")
+
+@app.post("/tasks/result", tags=["Hybrid"])
+async def submit_task_result(payload: TaskResultPayload, current_user: User = Depends(get_current_user)):
+    """Receive execution result from Local Agent and queue plan resumption safely."""
+    if not getattr(current_user, "is_agent", False):
+        raise HTTPException(status_code=403, detail="Not an agent identity")
+        
+    from datetime import datetime
+    from observability.tracer import tracer
+    import os
+    from rq import Queue
+    from redis import Redis
+
+    agent_id = current_user.bound_agent_id
+
+    with SessionLocal() as db:
+        task = db.query(LocalTask).with_for_update().filter(LocalTask.id == payload.task_id).first()
+        
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+            
+        if task.agent_id != agent_id:
+            logger.warning(f"Agent {agent_id} tried to complete Task {task.id} owned by {task.agent_id}")
+            raise HTTPException(status_code=403, detail="Task bound to different agent context")
+            
+        # Idempotency deduction — if this succeeds, it was already handled just return OK
+        if task.status in ("completed", "failed"):
+            logger.info(f"Duplicate result for task {task.id} ignored cleanly.")
+            return {"status": "ok", "notice": "Idempotent deduction triggered"}
+        
+        # Verify strict idempotency key bounds
+        if task.idempotency_key != payload.idempotency_key:
+            raise HTTPException(status_code=400, detail="Idempotency key mismatch")
+            
+        task.status = payload.status
+        task.result = payload.result
+        task.updated_at = datetime.utcnow()
+        db.commit()
+        
+        tracer.log_transition(task.request_id, task.plan_id, "running", payload.status, task.step_id, str(task.id))
+        
+        # Automatically unspool downstream if not handled
+        try:
+            redis_conn = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/"))
+            q = Queue("jarvis_tasks", connection=redis_conn)
+            q.enqueue(_bg_resume_plan, task.session_id, task.plan_id, current_user.id, task.request_id)
+        except Exception as e:
+            logger.error(f"[Tasks] Failed to enqueue resumption: {e}")
+
+    return {"status": "ok"}
+
 @app.post("/voice", tags=["Agent"])
 async def voice_endpoint(
     session_id: str = Form(...),
@@ -334,21 +519,38 @@ async def whatsapp_webhook(request: Request):
 @app.post("/voice/incoming", tags=["Channels"])
 async def voice_incoming(request: Request):
     """
-    Step 1 of the Twilio voice call flow.
+    Twilio Voice entry point.
 
-    Twilio hits this URL when a call connects.  We respond with TwiML that
-    greets the caller and immediately starts recording their speech.
-    The recording is POSTed to /voice/process once the caller stops speaking.
+    Branches based on USE_REALTIME_VOICE setting:
+      true  → Returns TwiML <Connect><Stream> pointing at the /ws/voice WebSocket
+               for real-time bi-directional Media Streams (low latency).
+      false → Returns TwiML <Record> which falls back to the legacy batch pipeline
+               (/voice/process) after the caller finishes speaking.
     """
     form = await request.form()
     caller: str = form.get("From", "unknown")
-    logger.info(f"[Voice] Incoming call from {caller}")
+    logger.info(f"[Voice] Incoming call from {caller} (realtime={settings.use_realtime_voice})")
 
-    # Build the process URL from the configured base URL
-    process_url = f"{settings.base_url}/voice/process"
+    if settings.use_realtime_voice:
+        # ── Real-time path: Twilio Media Streams WebSocket ──────────────────────
+        # Build WSS URL (Twilio requires wss://, not ws://)
+        ws_url = settings.base_url.replace("https://", "wss://").replace("http://", "wss://")
+        stream_url = f"{ws_url}/ws/voice"
+        logger.info(f"[Voice] Directing Media Stream to {stream_url}")
 
-    # TwiML response: greet the caller, then record up to 30 seconds
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{stream_url}">
+            <!-- Pass caller number so the WS handler can resolve identity -->
+            <Parameter name="caller" value="{caller}" />
+        </Stream>
+    </Connect>
+</Response>"""
+    else:
+        # ── Batch fallback path: Record → POST to /voice/process ───────────────
+        process_url = f"{settings.base_url}/voice/process"
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="Polly.Aditi" language="hi-IN">
         Namaste! Main JARVIS hoon. Aap kya jaanna chahte hain?
@@ -365,6 +567,7 @@ async def voice_incoming(request: Request):
 </Response>"""
 
     return Response(content=twiml, media_type="text/xml")
+
 
 
 @app.post("/voice/process", tags=["Channels"])
@@ -475,7 +678,40 @@ async def voice_process(request: Request):
     return Response(content=twiml, media_type="text/xml")
 
 
-# ─── Observability Endpoints ───────────────────────────────────────────────────
+# ─── Real-time Voice WebSocket (Twilio Media Streams) — NEW v7.1 ─────────────
+
+@app.websocket("/ws/voice")
+async def voice_media_stream(websocket: WebSocket):
+    """
+    Twilio Media Streams WebSocket endpoint for real-time voice interaction.
+
+    Twilio calls this URL after /voice/incoming returns a <Connect><Stream> TwiML.
+    The handler in voice/realtime.py manages the full bi-directional audio pipeline:
+
+      Twilio → WS → µ-law frames → VAD → Whisper STT → JARVIS → ElevenLabs TTS
+      → MP3 chunks → WS → Twilio (streamed, < 1.5s first response)
+
+    Only activated when USE_REALTIME_VOICE=true in .env.
+    Caller identity and role are resolved inside voice/realtime.py from the
+    'caller' custom parameter injected by the TwiML <Parameter> tag.
+    """
+    from voice.realtime import handle_media_stream
+
+    # Accept the WebSocket before delegating to the pipeline handler
+    await websocket.accept()
+    logger.info("[WS/Voice] Media Streams WebSocket accepted.")
+
+    try:
+        await handle_media_stream(websocket)
+    except WebSocketDisconnect:
+        logger.info("[WS/Voice] Client disconnected.")
+    except Exception as e:
+        logger.exception(f"[WS/Voice] Unhandled error: {e}")
+    finally:
+        logger.info("[WS/Voice] WebSocket session closed.")
+
+
+# ─── Observability Endpoints ───────────────────────────────────────────────
 
 from observability.logger import structured_logger
 

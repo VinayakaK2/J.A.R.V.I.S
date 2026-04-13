@@ -134,44 +134,89 @@ class OrchestratorAgent:
                 )
             return None  # Signal task is queued
 
-        # Generate Plan natively 
-        if settings.use_hierarchical_planner:
+        from learning.workflows import match_workflow
+        match_result = match_workflow(user_input, context)
+
+        # Route: if a usable workflow exists, always use the standard planner
+        # (it receives workflow guidance as a prompt, see planner.py)
+        if match_result and match_result.get("mode") != "fallback":
+            logger.info(
+                f"[Orchestrator] Workflow match found — mode={match_result['mode']}, "
+                f"confidence={match_result['confidence']:.2f}, "
+                f"semantic_sim={match_result['semantic_similarity']:.2f}"
+            )
+            plan = self.planner.create_plan(user_input, context=context, session_id=session_id)
+        elif settings.use_hierarchical_planner:
             logger.info("[Orchestrator] Generating Plan via V6 Hierarchical Engines")
             from planner_v6.high_level import hl_planner
             from planner_v6.low_level import ll_planner
             from agents.critic import critic_node
-            
-            # 1. Strategy
+
             strategy = hl_planner.generate_strategy(user_input, context)
-            
-            # 2. Map to Execute
             plan = ll_planner.map_to_executable(strategy, context)
-            
-            # 3. Critic check valve
+
             if settings.use_critic_agent:
                 review = critic_node.evaluate_plan(plan)
                 if not review.get("approved"):
-                    # Fast automatic 1-retry bounded context
                     logger.warning("[Orchestrator] Critic rejected initial hierarchical trace. Initiating re-map.")
                     context += f"\nCRITIC REJECTED PRIOR MAP: {review.get('feedback')}"
                     plan = ll_planner.map_to_executable(strategy, context)
         else:
-            # Fallback legacy V5 Planner
-            plan = self.planner.create_plan(user_input, context=context)
+            plan = self.planner.create_plan(user_input, context=context, session_id=session_id)
 
         is_valid, err_msg = validator.validate_plan(plan)
-        
-        # Super simple auto-fix via single replan if the format is fundamentally wrong
+
         if not is_valid:
             logger.warning(f"[Orchestrator] Plan Validation Failed: {err_msg}. Requesting immediate replan.")
             context += f"\nSystem: Previous plan failed validation -> {err_msg}. Fix tools and params."
-            if settings.use_hierarchical_planner:
-               from planner.low_level import ll_planner
-               from planner.high_level import hl_planner
+            if settings.use_hierarchical_planner and not match_result:
+               from planner_v6.low_level import ll_planner
+               from planner_v6.high_level import hl_planner
                plan = ll_planner.map_to_executable(hl_planner.generate_strategy(user_input, context), context)
             else:
-               plan = self.planner.create_plan(user_input, context=context)
-            
+               plan = self.planner.create_plan(user_input, context=context, session_id=session_id)
+
+        # ── 3-Mode Routing (authoritative mode comes from workflows.match_workflow) ──────
+        # The Plan already carries is_learned_workflow + workflow_confidence + workflow_sequence
+        # set by planner.create_plan. We use the match_result mode for the routing decision.
+        if match_result and getattr(plan, "is_learned_workflow", False):
+            mode = match_result.get("mode", "fallback")
+            conf = match_result["confidence"]
+            sem_sim = match_result["semantic_similarity"]
+            seq = getattr(plan, "workflow_sequence", "")
+
+            if mode == "auto":
+                # Both thresholds met — proceed without interrupting the user
+                logger.info(
+                    f"[Orchestrator] AUTO applying workflow (conf={conf:.2f}, sem={sem_sim:.2f}): {seq}"
+                )
+
+            elif mode == "ask":
+                # Medium confidence — pause and ask with full context
+                logger.info(
+                    f"[Orchestrator] Pausing to confirm workflow (conf={conf:.2f}, sem={sem_sim:.2f})"
+                )
+                reply = (
+                    f"I found your usual workflow for this: ({seq}).\n"
+                    f"Confidence: {conf:.0%}, Semantic match: {sem_sim:.0%}.\n"
+                    f"Do you want me to follow it, or would you prefer a fresh plan?"
+                )
+                self.memory.add_interaction(session_id, "assistant", reply)
+                # Cache the pending plan for resumption on user approval
+                try:
+                    import os
+                    from rq import Queue
+                    from redis import Redis
+                    redis_conn = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/"))
+                    q = Queue("jarvis_workflow_pending", connection=redis_conn)
+                    q.enqueue("dummy_pending", plan.json(), job_id=f"pending_{session_id}")
+                except Exception:
+                    pass
+                return reply
+
+            else:
+                logger.info(f"[Orchestrator] Fallback mode — ignoring workflow suggestion.")
+
         return plan
 
     # ── Node: Execute ─────────────────────────────────────────────────────────
@@ -195,6 +240,38 @@ class OrchestratorAgent:
                 error=r.get("error"),
             )
         return results
+
+    # ── Node: Resume ──────────────────────────────────────────────────────────
+
+    def resume_plan(self, session_id: str, plan_json: str, completed_ids: list):
+        """Resumes a parked Plan from a JSON payload (triggered by Local Agent)."""
+        plan = Plan.parse_raw(plan_json)
+        logger.info(f"[Orchestrator] Resuming hybrid plan {plan.plan_id} with {len(completed_ids)} completed steps.")
+        
+        # We execute with the completed_ids list mapped
+        results = self.executor.execute_plan(plan, role="owner", session_id=session_id, completed_ids=set(completed_ids))
+
+        # Log missing steps that executed during this pass
+        for r in results:
+            if r["step_id"] not in completed_ids:
+                if r["status"] == "local_queued": continue # Already parked again
+                self.memory.log_step_result(
+                    session_id=session_id,
+                    plan_id=plan.plan_id,
+                    step_id=r["step_id"],
+                    tool=next(
+                        (s.tool for s in plan.steps if s.step_id == r["step_id"]), "unknown"
+                    ),
+                    status=r["status"],
+                    output=str(r.get("output")) if r.get("output") else None,
+                    error=r.get("error"),
+                )
+
+        if not any(r["status"] == "local_queued" for r in results):
+            # Finalize entirely if none are parked
+            final_reply = self._node_respond(session_id, results, tone="professional")
+            self.memory.add_interaction(session_id, "assistant", final_reply)
+            logger.info(f"[Orchestrator] Hybrid plan {plan.plan_id} completed successfully.")
 
     # ── Node: Respond ─────────────────────────────────────────────────────────
 
@@ -246,6 +323,10 @@ class OrchestratorAgent:
         )
 
         plan = self._node_plan(session_id, user_input, role=role)
+
+        # If we got a direct text reply (like a workflow confirmation prompt), return it directly.
+        if isinstance(plan, str):
+            return self.responder.format_response(plan, tone, channel=channel)
 
         # Scheduling path: task was queued, reply immediately
         if plan is None:

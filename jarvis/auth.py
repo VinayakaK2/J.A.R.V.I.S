@@ -30,6 +30,16 @@ def create_access_token(data: dict):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+def create_agent_token(user_id: int, agent_id: str):
+    """Binds an agent instance uniquely to a user, rejecting generic node impersonation."""
+    data = {
+        "sub": f"agent:{agent_id}",
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "type": "agent"
+    }
+    return create_access_token(data)
+
 def decode_access_token(token: str):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -42,6 +52,21 @@ def decode_access_token(token: str):
 def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
     token = credentials.credentials
     payload = decode_access_token(token)
+    
+    # Check if this is an Agent Context token
+    if payload.get("type") == "agent":
+        user_id = payload.get("user_id")
+        agent_id = payload.get("agent_id")
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                raise HTTPException(status_code=401, detail="Bound user dropped")
+            # We inject the agent constraint context onto the user object dynamically 
+            # so standard dependencies know an agent is making the call.
+            user.is_agent = True
+            user.bound_agent_id = agent_id
+            return user
+
     username: str = payload.get("sub")
     if username is None:
         raise HTTPException(status_code=401, detail="Could not validate credentials")
@@ -50,4 +75,5 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(securi
         user = db.query(User).filter(User.username == username).first()
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
+        user.is_agent = False
         return user

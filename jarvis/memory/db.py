@@ -1,11 +1,12 @@
 import json
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 from config.settings import settings
 
-# SQLAlchemy engine — check_same_thread=False required for SQLite with async usage
-engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
+# Gracefully support either SQLite (dev fallback) or PostgreSQL (Production)
+connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+engine = create_engine(settings.database_url, connect_args=connect_args)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -107,6 +108,67 @@ class PlanPattern(Base):
     tool_chain  = Column(Text)   # JSON literal of [tool1, tool2, ...]
     outcome     = Column(String) # success, failed
     timestamp   = Column(DateTime, default=datetime.utcnow)
+
+# ─── Hybrid Cloud/Local Extension ─────────────────────────────────────────────
+
+# Tracks overall plan execution state reliably, avoiding large fragile local JSON dumps
+class ExecutionState(Base):
+    __tablename__ = "execution_states"
+    
+    id              = Column(Integer, primary_key=True, index=True)
+    session_id      = Column(String, index=True)
+    plan_id         = Column(String, unique=True, index=True)
+    request_id      = Column(String, index=True)          # Links observability chain upward
+    
+    current_step    = Column(Integer, default=0)          # Pointer
+    steps           = Column(Text)                        # Plan JSON or strict representation
+    completed_steps = Column(Text, default="[]")          # JSON array of successfully run step IDs
+    
+    status          = Column(String, default="running")   # running, waiting_for_local, completed, failed
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# Queued tasks explicitly bound to run locally on the user's personal context
+class LocalTask(Base):
+    __tablename__ = "local_tasks"
+    
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, index=True)       # The owner of the local agent
+    agent_id    = Column(String, index=True)        # Specifically assigned distributed agent instance
+    
+    idempotency_key = Column(String, unique=True, index=True) # Prevent duplicates across network
+    
+    request_id  = Column(String, index=True)        # Observability chain
+    session_id  = Column(String, index=True)
+    plan_id     = Column(String, index=True)
+    step_id     = Column(String, index=True)
+    plan_json   = Column(Text, nullable=True)       # Deprecated when USE_EXECUTION_STATE=True
+
+    action      = Column(String)                    # Tool name
+    params      = Column(Text)                      # JSON serialized kwargs
+    
+    status      = Column(String, default="pending") # pending, running, completed, failed
+    result      = Column(Text, nullable=True)       
+    
+    priority        = Column(Integer, default=1)
+    retries         = Column(Integer, default=0)
+    max_retries     = Column(Integer, default=3)
+    last_attempt_at = Column(DateTime, nullable=True)
+    
+    created_at  = Column(DateTime, default=datetime.utcnow)
+    updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# Online presence tracker for the user's remote local agent
+class AgentStatus(Base):
+    __tablename__ = "agent_status"
+    
+    id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, index=True)
+    agent_id       = Column(String, unique=True, index=True) # Identify instances
+    last_heartbeat = Column(DateTime, default=datetime.utcnow)
+    status         = Column(String, default="offline") # online, offline
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
 

@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     use_hierarchical_planner: bool = True   # ENABLED for Phase 2 validation
     use_simulation: bool = False
     use_critic_agent: bool = True           # ENABLED for Phase 2 validation
+    use_execution_state: bool = False       # FEATURE FLAG: Production non-blocking state manager
 
     # Application log level
     log_level: str = "INFO"
@@ -37,6 +38,19 @@ class Settings(BaseSettings):
     # Telegram Bot token for message delivery
     telegram_bot_token: str = ""
 
+    # ── Real-time Voice Streaming (v7 upgrade) ──
+    # Enable Twilio Media Streams WebSocket for low-latency calls
+    use_realtime_voice: bool = True
+    # Energy threshold for voice activity detection (tune to mic/room noise level)
+    # Lower = more sensitive, Higher = requires louder speech to trigger
+    vad_energy_threshold: int = 300
+    # Consecutive silent 20ms frames before end-of-utterance is declared (40 = 800ms)
+    vad_silence_frames: int = 40
+    # Number of voice turns to keep in rolling in-memory context per call
+    voice_memory_turns: int = 5
+    # ElevenLabs model for streaming TTS — turbo_v2 has lowest latency
+    elevenlabs_stream_model: str = "eleven_turbo_v2"
+
     # ── Owner Identity (loaded from env — never hardcode in source) ──
     # Used by auth/identity.py to determine owner vs. guest role
     owner_phone: str = "+91XXXXXXXXXX"
@@ -44,7 +58,7 @@ class Settings(BaseSettings):
     owner_name: str = "Vinayaka"
 
     # Background agent scheduled task poll interval in seconds
-    background_poll_interval: int = 10
+    background_poll_interval: int = 5
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

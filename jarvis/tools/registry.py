@@ -58,6 +58,16 @@ class ToolRegistry:
     def get_tool(self, name: str) -> Optional[Callable]:
         return self.registry.get(name)
 
+    # Return the environment context tag for a specific tool
+    def get_tool_environment(self, name: str) -> str:
+        """Returns 'local' if the tool requires desktop/user automation, else 'cloud'."""
+        local_tools = {
+            "open_application", "open_website", "type_text", "press_keys", 
+            "click", "open_url", "search_google", "click_selector", 
+            "fill_input", "click_native_element", "fill_native_input"
+        }
+        return "local" if name in local_tools else "cloud"
+
     # Return all registered tool names
     def get_available_tools(self) -> list:
         return list(self.registry.keys())

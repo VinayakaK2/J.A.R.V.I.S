@@ -18,8 +18,13 @@ def _make_result(step_id: int, status: str, output: Any = None, error: Optional[
 from observability.logger import structured_logger
 from perception.vision import perception
 from learning.metrics import metrics
+from learning.event_logger import workflow_logger
 
 # ─── Executor Agent ────────────────────────────────────────────────────────────
+
+class LocalTaskQueued(Exception):
+    """Signal raised when an execution step is deferred to a local polling agent."""
+    pass
 
 # Executes a validated Plan, enforcing safety checks and retry logic on each step
 class ToolExecutorAgent:
@@ -33,7 +38,7 @@ class ToolExecutorAgent:
     # Dynamically attempts to replan when OCR validation specifically invalidates states
     def replan_remaining_steps(self, context_goal: str, failed_step: PlanStep, vision_state: Dict, plan: Plan):
         logger.warning(f"[Executor] Triggering REPLAN from step {failed_step.step_id}.")
-        if not self.planner:
+        if getattr(self, "planner", None) is None:
             from planner import TaskPlannerAgent
             self.planner = TaskPlannerAgent()
             
@@ -50,11 +55,47 @@ class ToolExecutorAgent:
 
     # Execute a single step with safety gating, retry logic, and perception checks.
     # role is forwarded to the guard for role-based access control.
-    def _execute_step(self, step: PlanStep, goal_context: str, role: str = "guest") -> Dict:
+    def _execute_step(self, step: PlanStep, goal_context: str, role: str = "guest", user_id: int = 1) -> Dict:
         tool_name = step.tool
         params = step.params
 
         structured_logger.log_event("STEP_PENDING", {"step_id": step.step_id, "tool": tool_name})
+        
+        # ── Local Agent Splitting Logic (Non-blocking queueing) ────────────────
+        if self.registry.get_tool_environment(tool_name) == "local":
+            import json
+            import uuid
+            from memory.db import SessionLocal, LocalTask
+            # Insert task into database and suspend current executor immediately
+            
+            idem_key = f"t-{getattr(self, '_current_request_id', 'req')}-{step.step_id}"
+            with SessionLocal() as db:
+                # Idempotent enqueue 
+                if not db.query(LocalTask).filter_by(idempotency_key=idem_key).first():
+                    lt = LocalTask(
+                        user_id=user_id,
+                        idempotency_key=idem_key,
+                        request_id=getattr(self, "_current_request_id", "unknown"),
+                        session_id=getattr(self, "_current_session_id", "unknown"),
+                        plan_id=getattr(self, "_current_plan_id", "unknown"),
+                        step_id=str(step.step_id),
+                        plan_json=getattr(self, "_current_plan_json", None), # Fallback mapping
+                        action=tool_name,
+                        params=json.dumps(params),
+                        status="pending",
+                        priority=1
+                    )
+                    db.add(lt)
+                    db.commit()
+            
+            logger.info(f"[Executor] Tool '{tool_name}' requires local execution. Queued LocalTask for polling.")
+            structured_logger.log_event("STEP_QUEUED_LOCAL", {"step_id": step.step_id, "tool": tool_name})
+            
+            if settings.use_execution_state:
+                return _make_result(step.step_id, "waiting_for_local")
+            else:
+                # Legacy explicit abort mechanism
+                raise LocalTaskQueued(str(step.step_id))
 
         # ── Safety check (includes RBAC via role) ──────────────────────────────
         level, reason = self.guard.evaluate_action(tool_name, params, role=role)
@@ -141,20 +182,66 @@ class ToolExecutorAgent:
         from reasoning.failure_engine import failure_diagnostics
         diagnostic = failure_diagnostics.analyze_failure(step.action, last_error, vision_result_cache)
         logger.error(f"[Executor] Step {step.step_id} permanently FAILED. Diagnosis: {diagnostic.get('failure_type')} - {diagnostic.get('reason')}")
-        
+
         structured_logger.log_event("STEP_FAILED", {"step_id": step.step_id, "diagnostic": diagnostic})
         metrics.log_tool_failure(tool_name)
-        
+
+        # Log failure into the behavioral modeling pipeline so future workflows
+        # avoid reusing this tool in this context when it has a high failure rate.
+        try:
+            workflow_logger.log_task_failure(
+                session_id=getattr(self, "_current_session_id", "unknown"),
+                task_id=getattr(self, "_current_plan_id", "unknown"),
+                tool=tool_name,
+                failure_reason=last_error,
+            )
+        except Exception:
+            pass  # Never let telemetry crash the main execution path
+
         # Trigger true replanning implicitly by injecting marker
         import json
         diagnostic_payload = json.dumps({"vision": vision_result_cache, "diagnostic": diagnostic})
         raise Exception(f"__REPLAN_REQUIRED__::{last_error}::{diagnostic_payload}")
 
     # Execute all steps in a Plan, respecting declared dependencies.
-    # role is threaded through to each step's safety check.
-    def execute_plan(self, plan: Plan, role: str = "guest") -> List[Dict]:
+    # Accepts previously finished steps allowing asynchronous stateless resumptions.
+    def execute_plan(self, plan: Plan, role: str = "guest", session_id: str = "unknown", 
+                     user_id: int = 1, completed_ids: set = None, request_id: str = None) -> List[Dict]:
+        from learning.event_logger import workflow_logger
+        import uuid
+        
+        # Hydrate execution tracking states downstream
+        self._current_session_id = session_id
+        self._current_plan_id = plan.plan_id
+        self._current_request_id = request_id or str(uuid.uuid4())
+        self._current_plan_json = plan.json()
+
+        # Database ExecutionState Tracking
+        if settings.use_execution_state:
+            from memory.db import SessionLocal, ExecutionState
+            import json
+            with SessionLocal() as db:
+                es = db.query(ExecutionState).filter_by(plan_id=plan.plan_id).first()
+                if not es:
+                    es = ExecutionState(
+                        session_id=session_id,
+                        plan_id=plan.plan_id,
+                        request_id=self._current_request_id,
+                        steps=self._current_plan_json,
+                        completed_steps=json.dumps(list(completed_ids or []))
+                    )
+                    db.add(es)
+                else:
+                    loaded = json.loads(es.completed_steps)
+                    if completed_ids:
+                        loaded.extend(list(completed_ids))
+                    completed_ids = set(loaded)
+                    es.completed_steps = json.dumps(list(completed_ids))
+                    es.status = "running"
+                db.commit()
+
         # Pre-simulation hook
-        if settings.use_simulation:
+        if settings.use_simulation and not completed_ids: # Only run on first fresh pass
             from simulation.simulator import simulator_node
             sim = simulator_node.simulate_plan(plan, "Execution Boot Sequence")
             if sim.get("simulate_verdict") == "reject":
@@ -164,8 +251,8 @@ class ToolExecutorAgent:
         results: Dict[int, Dict] = {}  # step_id → result
 
         # Topologically sort steps by depends_on to run in the right order
-        completed_ids: set = set()
-        remaining = list(plan.steps)
+        completed_ids = set(completed_ids) if completed_ids else set()
+        remaining = [s for s in plan.steps if s.step_id not in completed_ids]
         max_iterations = len(remaining) * 2  # Guard against circular deps
         iteration = 0
 
@@ -193,8 +280,23 @@ class ToolExecutorAgent:
                     results[step.step_id] = result
                     made_progress = True
 
-                    if result["status"] == "success":
+                    if result["status"] == "waiting_for_local":
+                        # Native non-exception state machine execution loop parked.
+                        logger.info(f"[Executor] Execution parked natively (WAITING_FOR_LOCAL) at step {step.step_id}.")
+                        if settings.use_execution_state:
+                            from memory.db import SessionLocal, ExecutionState
+                            import json
+                            with SessionLocal() as db:
+                                es = db.query(ExecutionState).filter_by(plan_id=plan.plan_id).first()
+                                if es:
+                                    es.status = "waiting_for_local"
+                                    es.completed_steps = json.dumps(list(completed_ids))
+                                    db.commit()
+                        return list(results.values())
+                    elif result["status"] == "success":
                         completed_ids.add(step.step_id)
+                        # Log structured tool usage to modeling pipeline
+                        workflow_logger.log_tool_usage(session_id, plan.plan_id, step.tool, step.action)
                     else:
                         # Dependent steps that rely on a failed step will be skipped
                         logger.warning(
@@ -202,6 +304,24 @@ class ToolExecutorAgent:
                             f"(status={result['status']}); downstream steps may be skipped."
                         )
                         completed_ids.add(step.step_id)  # Still mark done to avoid infinite loop
+                except LocalTaskQueued as lq:
+                    # Legacy Fallback mechanism if USE_EXECUTION_STATE=False
+                    # Park execution gracefully — wait for agent result pingback.
+                    # Inject the serialized plan into the DB row so resumption can reload the entire workflow.
+                    from memory.db import SessionLocal, LocalTask
+                    with SessionLocal() as db:
+                        lt = db.query(LocalTask).filter_by(
+                            plan_id=plan.plan_id, 
+                            step_id=str(step.step_id), 
+                            status="pending"
+                        ).first()
+                        if lt:
+                            lt.plan_json = plan.json()
+                            db.commit()
+
+                    results[step.step_id] = _make_result(step.step_id, "local_queued")
+                    logger.info(f"[Executor] Execution parked cleanly waiting on Agent for step {step.step_id}.")
+                    return list(results.values())
                 except Exception as exc:
                     err_str = str(exc)
                     if "__REPLAN_REQUIRED__" in err_str:
@@ -226,6 +346,9 @@ class ToolExecutorAgent:
                         error="Dependency could not be satisfied."
                     )
                 break
+
+        overall_success = (len(completed_ids) == len(plan.steps))
+        workflow_logger.log_task_end(session_id, plan.plan_id, overall_success)
 
         return list(results.values())
 

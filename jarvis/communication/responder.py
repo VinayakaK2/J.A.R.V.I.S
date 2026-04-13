@@ -23,10 +23,11 @@ logger = logging.getLogger(__name__)
 
 # Maximum character lengths per channel to keep messages digestible
 _CHANNEL_MAX_LEN: dict = {
-    "voice":     300,   # TTS reads long replies slowly — keep short
-    "whatsapp":  600,   # WhatsApp chat bubble limit (practical)
-    "telegram":  1024,  # Telegram message limit per bubble
-    "default":   4096,  # REST/browser — generous limit
+    "voice":        300,   # Batch TTS — keep short
+    "voice_stream": 150,   # Real-time streaming TTS — one sentence per chunk
+    "whatsapp":     600,   # WhatsApp chat bubble limit (practical)
+    "telegram":     1024,  # Telegram message limit per bubble
+    "default":      4096,  # REST/browser — generous limit
 }
 
 
@@ -86,13 +87,22 @@ class CommunicationAgent:
     def _format_for_channel(self, text: str, channel: str) -> str:
         """Apply channel-specific text transformations."""
 
-        if channel == "voice":
+        if channel in ("voice", "voice_stream"):
             # Strip all markdown — TTS engines read symbols aloud otherwise
             text = _strip_markdown(text)
             # Convert bullet lists to comma-separated sentences
             text = re.sub(r"\n\s*[-•]\s*", ", ", text)
             # Remove leftover newlines
             text = text.replace("\n", " ").strip()
+            if channel == "voice_stream":
+                # Real-time mode: collapse to a single short sentence
+                # Remove filler like "Sure!", "Of course!", "Great question!"
+                text = re.sub(
+                    r"^(Sure[!,]?|Of course[!,]?|Great[!,]?|Certainly[!,]?|\s)+",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                ).strip()
             return text
 
         if channel == "whatsapp":
