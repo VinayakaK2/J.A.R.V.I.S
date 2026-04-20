@@ -320,9 +320,6 @@ async def poll_local_tasks(current_user: User = Depends(get_current_user)):
             LocalTask.user_id == current_user.id,
             LocalTask.status == "pending"
         ).order_by(LocalTask.priority.desc(), LocalTask.created_at.asc()).first()
-            LocalTask.user_id == current_user.id,
-            LocalTask.status == "pending"
-        ).order_by(LocalTask.created_at.asc()).first()
 
         if not task:
             db.commit()
@@ -723,6 +720,18 @@ async def get_logs(limit: int = 100, current_user: User = Depends(get_current_us
         return {"count": len(logs), "logs": logs}
     except Exception as e:
         logger.exception("[/logs] Error reading logs")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/skills/selection-debug", tags=["Observability"])
+async def get_skill_selection_debug(limit: int = 50, current_user: User = Depends(get_current_user)):
+    """Returns observability logs for dynamic skill selection scoring and exploration probabilities."""
+    try:
+        logs = structured_logger.read_recent_logs(limit=limit * 10)
+        selection_logs = [L for L in logs if L.get("event") == "SKILL_SELECTION_DEBUG"]
+        return {"count": len(selection_logs), "debug_traces": selection_logs[:limit]}
+    except Exception as e:
+        logger.exception("[/skills/selection-debug] Error")
         raise HTTPException(status_code=500, detail=str(e))
 
 

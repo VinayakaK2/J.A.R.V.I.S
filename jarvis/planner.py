@@ -101,7 +101,7 @@ Required JSON format:
             return None
 
     # Main entry point: produce a validated Plan from user intent
-    def create_plan(self, user_intent: str, context: Optional[str] = None, session_id: str = "unknown") -> Optional[Plan]:
+    def create_plan(self, user_intent: str, context: Optional[str] = None, session_id: str = "unknown", skills_context: str = "") -> Optional[Plan]:
         from learning.event_logger import workflow_logger
         from learning.workflows import match_workflow
 
@@ -125,6 +125,9 @@ Required JSON format:
         messages = [SystemMessage(content=self._build_system_prompt())]
         if context:
             messages.append(SystemMessage(content=f"User context:\n{context}"))
+            
+        if skills_context:
+            messages.append(SystemMessage(content=skills_context))
 
         # ── Workflow Injection (adaptive guidance, not rigid copy) ─────────────
         # match_workflow now returns a bundle: {workflow, confidence, semantic_similarity, mode}

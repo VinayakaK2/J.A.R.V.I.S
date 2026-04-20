@@ -11,7 +11,7 @@ class CriticAgent:
     def __init__(self):
         self.is_enabled = bool(settings.openai_api_key and not settings.openai_api_key.startswith("your_"))
         
-    def evaluate_plan(self, plan: Plan) -> Dict[str, Any]:
+    def evaluate_plan(self, plan: Plan, skills_context: str = "", req_id: str = None) -> Dict[str, Any]:
         """
         Acts as a safety check-valve intercepting Low-Level plans. 
         Detects unhandled logic leaps or extreme security violations before Simulator runs.
@@ -34,6 +34,8 @@ Proposed Goal: "{plan.goal}"
 Steps Sequence:
 {steps_repr}
 
+{skills_context}
+
 Look explicitly for:
 1. Missing prerequisite logical steps (e.g., trying to click a button before opening the application).
 2. Overtly unsafe actions (e.g., attempting a system wipe).
@@ -41,10 +43,12 @@ Look explicitly for:
 4. Efficiency Checks: Detect unnecessary steps and suggest direct tool alternatives instead. For example, suggest using `open_url` directly instead of manually opening a browser and trying to click the address bar to type.
 
 If the sequence is fundamentally sound, approve it. If there is a massive logic hole, invalid tool, or severe inefficiency, reject it.
+Also evaluate the plan's overall quality considering the skills injected. Give a plan_quality_score between 0.0 and 1.0.
 Return structured JSON:
 {{
   "approved": true/false,
-  "feedback": "1-2 sentences. If rejected, tell the low-level planner explicitly what tool it should use instead (e.g., 'Use open_url instead of run_terminal_command')."
+  "feedback": "1-2 sentences. If rejected, tell the low-level planner explicitly what tool it should use instead (e.g., 'Use open_url instead of run_terminal_command').",
+  "plan_quality_score": 0.8
 }}"""
 
             from openai import OpenAI
@@ -65,6 +69,10 @@ Return structured JSON:
                 logger.info(f"[Critic] Plan Approved: {out.get('feedback')}")
             else:
                 logger.warning(f"[Critic] Plan REJECTED: {out.get('feedback')}")
+                
+            if out.get("plan_quality_score") is not None and req_id:
+                from skills.metrics import skill_metrics
+                skill_metrics.log_plan_quality(req_id, out.get("plan_quality_score"))
                 
             return out
         except Exception as e:

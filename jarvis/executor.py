@@ -176,6 +176,7 @@ class ToolExecutorAgent:
                 logger.warning(f"[Executor] Step {step.step_id} attempt {attempt} FAILED: {last_error}")
                 if attempt < attempts:
                     structured_logger.log_event("STEP_RETRYING", {"step_id": step.step_id, "error": last_error, "attempt": attempt})
+                    self._current_retries = getattr(self, "_current_retries", 0) + 1
                     time.sleep(1)  # Brief back-off before retry
 
         # Determine Reason utilizing Failure Engine!
@@ -210,6 +211,7 @@ class ToolExecutorAgent:
         from learning.event_logger import workflow_logger
         import uuid
         
+        self._current_retries = getattr(self, "_current_retries", 0)
         # Hydrate execution tracking states downstream
         self._current_session_id = session_id
         self._current_plan_id = plan.plan_id
@@ -349,6 +351,26 @@ class ToolExecutorAgent:
 
         overall_success = (len(completed_ids) == len(plan.steps))
         workflow_logger.log_task_end(session_id, plan.plan_id, overall_success)
+
+        if getattr(self, "_current_request_id", None) and self._current_request_id != "unknown":
+            from skills.metrics import skill_metrics
+            # Only log it if we didn't just part-way execute due to a local queue wait.
+            # Local queue returns early without throwing, so overall_success would be false if waiting.
+            # We must be careful to not log failure purely because it's parked.
+            if not any(r["status"] == "waiting_for_local" for r in results.values()):
+                skill_metrics.log_execution_success(
+                    self._current_request_id, 
+                    overall_success, 
+                    getattr(self, "_current_retries", 0)
+                )
+                
+                # Trigger Skill Generation & Evolution
+                if overall_success:
+                    try:
+                        from skills.generator import skill_evolution_engine
+                        skill_evolution_engine.process_successful_execution(plan, list(results.values()))
+                    except Exception as e:
+                        logger.error(f"[Executor] Skill Evolution hook failed: {e}")
 
         return list(results.values())
 

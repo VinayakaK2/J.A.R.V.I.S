@@ -13,7 +13,7 @@ class LowLevelPlanner:
         self.registry = ToolRegistry()
         self.is_enabled = bool(settings.openai_api_key and not settings.openai_api_key.startswith("your_"))
         
-    def _build_llm_prompt(self, strategy: Dict[str, Any], context: str) -> str:
+    def _build_llm_prompt(self, strategy: Dict[str, Any], context: str, skills_context: str = "") -> str:
         tools_list = self.registry.get_tools_info()
         tools_str = "\n".join(
             f"- {info['name']}: {info['description']}" for info in tools_list
@@ -27,6 +27,8 @@ Subgoals to accomplish:
 {json.dumps(strategy.get('subgoals', []))}
 
 {context}
+
+{skills_context}
 
 Available Tools (DO NOT INVENT TOOLS):
 {tools_str}
@@ -53,7 +55,7 @@ Required JSON format:
   ]
 }}"""
 
-    def map_to_executable(self, strategy: Dict[str, Any], bias_context: str = "") -> Plan:
+    def map_to_executable(self, strategy: Dict[str, Any], bias_context: str = "", skills_context: str = "") -> Plan:
         if not self.is_enabled:
             # Fallback trivial stub
             return Plan(goal=strategy.get("goal", "Goal"), steps=[
@@ -64,7 +66,7 @@ Required JSON format:
             from openai import OpenAI
             client = OpenAI(api_key=settings.openai_api_key)
 
-            prompt = self._build_llm_prompt(strategy, bias_context)
+            prompt = self._build_llm_prompt(strategy, bias_context, skills_context)
             response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],

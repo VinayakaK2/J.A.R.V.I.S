@@ -10,7 +10,7 @@ class HighLevelPlanner:
     def __init__(self):
         self.is_enabled = bool(settings.openai_api_key and not settings.openai_api_key.startswith("your_"))
         
-    def generate_strategy(self, user_intent: str, active_context: str = "") -> Dict[str, Any]:
+    def generate_strategy(self, user_intent: str, active_context: str = "", skills_context: str = "") -> Dict[str, Any]:
         """
         Translates raw human instruction into a logical chunked list of subgoals.
         Output format: {"goal": "...", "subgoals": ["...", "..."]}
@@ -26,6 +26,8 @@ class HighLevelPlanner:
 Your job is NOT to pick specific tools. Your job is to break a complex intent into generic logical SUB-GOALS.
 Current Intent: "{user_intent}"
 Context/Previous Output: "{active_context}"
+
+{skills_context}
 
 Reply STRICTLY in JSON format:
 {{
