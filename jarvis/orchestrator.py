@@ -104,7 +104,7 @@ class OrchestratorAgent:
 
     # Classify intent, build a Plan, or enqueue a scheduled task.
     # role is passed down to the executor so the guard can enforce RBAC.
-    def _node_plan(self, session_id: str, user_input: str, role: str = "guest"):
+    def _node_plan(self, session_id: str, user_input: str, role: str = "guest", req_id: str = None):
         from planner_validator import validator
         from config.settings import settings
 
@@ -115,12 +115,27 @@ class OrchestratorAgent:
         history = self.memory.get_recent_interactions(session_id, limit=5)
         context = "\n".join(f"{h['role']}: {h['content']}" for h in history)
 
+        from skills.selector import select_skills
+        from skills.injector import inject_skills_into_prompt
+        import uuid
+        
+        # Step 1: Skill Selection & Injection
+        req_id = req_id or str(uuid.uuid4())[:8]
+        selected_skills = select_skills(user_input, context)
+        skills_context = inject_skills_into_prompt(selected_skills)
+        
+        from skills.metrics import skill_metrics
+        skill_metrics.log_selected_skills(req_id, [s.name for s in selected_skills])
+        
+        # Observability Logging
+        logger.info(f"[Orchestrator] ReqID: {req_id} | Session: {session_id} | Selected Skills: {[s.name for s in selected_skills]}")
+
         plan = None
         # Route scheduling intents to the background queue
         if self._is_scheduling_intent(user_input):
             logger.info(f"[Orchestrator] Scheduling intent detected: '{user_input}'")
             run_at, recurrence = self._parse_run_at(user_input)
-            plan = self.planner.create_plan(user_input, context=context)
+            plan = self.planner.create_plan(user_input, context=context, skills_context=skills_context)
             if plan and plan.steps:
                 first_step = plan.steps[0]
                 self.memory.enqueue_task(
@@ -145,24 +160,24 @@ class OrchestratorAgent:
                 f"confidence={match_result['confidence']:.2f}, "
                 f"semantic_sim={match_result['semantic_similarity']:.2f}"
             )
-            plan = self.planner.create_plan(user_input, context=context, session_id=session_id)
+            plan = self.planner.create_plan(user_input, context=context, session_id=session_id, skills_context=skills_context)
         elif settings.use_hierarchical_planner:
             logger.info("[Orchestrator] Generating Plan via V6 Hierarchical Engines")
             from planner_v6.high_level import hl_planner
             from planner_v6.low_level import ll_planner
             from agents.critic import critic_node
 
-            strategy = hl_planner.generate_strategy(user_input, context)
-            plan = ll_planner.map_to_executable(strategy, context)
+            strategy = hl_planner.generate_strategy(user_input, context, skills_context=skills_context)
+            plan = ll_planner.map_to_executable(strategy, context, skills_context=skills_context)
 
             if settings.use_critic_agent:
-                review = critic_node.evaluate_plan(plan)
+                review = critic_node.evaluate_plan(plan, skills_context=skills_context, req_id=req_id)
                 if not review.get("approved"):
-                    logger.warning("[Orchestrator] Critic rejected initial hierarchical trace. Initiating re-map.")
+                    logger.warning(f"[Orchestrator] ReqID: {req_id} | Critic rejected initial hierarchical trace. Initiating re-map.")
                     context += f"\nCRITIC REJECTED PRIOR MAP: {review.get('feedback')}"
-                    plan = ll_planner.map_to_executable(strategy, context)
+                    plan = ll_planner.map_to_executable(strategy, context, skills_context=skills_context)
         else:
-            plan = self.planner.create_plan(user_input, context=context, session_id=session_id)
+            plan = self.planner.create_plan(user_input, context=context, session_id=session_id, skills_context=skills_context)
 
         is_valid, err_msg = validator.validate_plan(plan)
 
@@ -172,9 +187,9 @@ class OrchestratorAgent:
             if settings.use_hierarchical_planner and not match_result:
                from planner_v6.low_level import ll_planner
                from planner_v6.high_level import hl_planner
-               plan = ll_planner.map_to_executable(hl_planner.generate_strategy(user_input, context), context)
+               plan = ll_planner.map_to_executable(hl_planner.generate_strategy(user_input, context, skills_context=skills_context), context, skills_context=skills_context)
             else:
-               plan = self.planner.create_plan(user_input, context=context, session_id=session_id)
+               plan = self.planner.create_plan(user_input, context=context, session_id=session_id, skills_context=skills_context)
 
         # ── 3-Mode Routing (authoritative mode comes from workflows.match_workflow) ──────
         # The Plan already carries is_learned_workflow + workflow_confidence + workflow_sequence
@@ -223,8 +238,8 @@ class OrchestratorAgent:
 
     # Run all steps in the plan and log results to memory.
     # role is forwarded to execute_plan so the safety guard can apply RBAC.
-    def _node_execute(self, session_id: str, plan: Plan, role: str = "guest") -> List[Dict]:
-        results = self.executor.execute_plan(plan, role=role)
+    def _node_execute(self, session_id: str, plan: Plan, role: str = "guest", req_id: str = None) -> List[Dict]:
+        results = self.executor.execute_plan(plan, role=role, session_id=session_id, request_id=req_id)
 
         # Persist each step result for audit / future recall
         for r in results:
@@ -317,12 +332,15 @@ class OrchestratorAgent:
         channel: str = "default",
         role: str = "guest",
     ) -> str:
+        import uuid
+        req_id = str(uuid.uuid4())[:8]
+
         logger.info(
             f"[Orchestrator] Processing request session={session_id} "
-            f"channel={channel} role={role}"
+            f"channel={channel} role={role} req_id={req_id}"
         )
 
-        plan = self._node_plan(session_id, user_input, role=role)
+        plan = self._node_plan(session_id, user_input, role=role, req_id=req_id)
 
         # If we got a direct text reply (like a workflow confirmation prompt), return it directly.
         if isinstance(plan, str):
@@ -333,5 +351,5 @@ class OrchestratorAgent:
             return self._node_respond(session_id, [], tone, channel=channel, scheduled=True)
 
         # Execution path: run the plan with role forwarded to the guard
-        results = self._node_execute(session_id, plan, role=role)
+        results = self._node_execute(session_id, plan, role=role, req_id=req_id)
         return self._node_respond(session_id, results, tone, channel=channel)
