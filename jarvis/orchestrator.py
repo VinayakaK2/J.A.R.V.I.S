@@ -104,7 +104,7 @@ class OrchestratorAgent:
 
     # Classify intent, build a Plan, or enqueue a scheduled task.
     # role is passed down to the executor so the guard can enforce RBAC.
-    def _node_plan(self, session_id: str, user_input: str, role: str = "guest", req_id: str = None):
+    def _node_plan(self, session_id: str, user_input: str, role: str = "guest", req_id: str = None, context_override: str = None):
         from planner_validator import validator
         from config.settings import settings
 
@@ -112,8 +112,11 @@ class OrchestratorAgent:
         self.memory.add_interaction(session_id, "user", user_input)
 
         # Build context string from recent history for the planner
-        history = self.memory.get_recent_interactions(session_id, limit=5)
-        context = "\n".join(f"{h['role']}: {h['content']}" for h in history)
+        if context_override:
+            context = context_override
+        else:
+            history = self.memory.get_recent_interactions(session_id, limit=5)
+            context = "\n".join(f"{h['role']}: {h['content']}" for h in history)
 
         from skills.selector import select_skills
         from skills.injector import inject_skills_into_prompt
@@ -331,6 +334,7 @@ class OrchestratorAgent:
         tone: str = "professional",
         channel: str = "default",
         role: str = "guest",
+        context_override: str = None,
     ) -> str:
         import uuid
         req_id = str(uuid.uuid4())[:8]
@@ -340,7 +344,7 @@ class OrchestratorAgent:
             f"channel={channel} role={role} req_id={req_id}"
         )
 
-        plan = self._node_plan(session_id, user_input, role=role, req_id=req_id)
+        plan = self._node_plan(session_id, user_input, role=role, req_id=req_id, context_override=context_override)
 
         # If we got a direct text reply (like a workflow confirmation prompt), return it directly.
         if isinstance(plan, str):
