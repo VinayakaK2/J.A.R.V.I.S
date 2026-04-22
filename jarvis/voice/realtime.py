@@ -137,15 +137,15 @@ def compute_energy(pcm_bytes: bytes) -> int:
 
 # ─── Whisper STT (streaming accumulate → transcribe) ─────────────────────────
 
-async def transcribe_pcm(pcm_bytes: bytes) -> str:
+async def transcribe_pcm(pcm_bytes: bytes, sample_rate: int = MULAW_RATE) -> str:
     """
     Transcribe accumulated PCM audio bytes via OpenAI Whisper.
 
-    Converts 16-bit PCM 8kHz → WAV in-memory, then sends to Whisper.
+    Converts 16-bit PCM to WAV in-memory, then sends to Whisper.
     Returns empty string on failure so the caller can skip silently.
     """
-    if not settings.openai_api_key or len(pcm_bytes) < 1600:
-        # Need at least ~100ms of audio (1600 bytes @ 8kHz 16-bit)
+    if not settings.openai_api_key or len(pcm_bytes) < (sample_rate // 5):
+        # Need at least ~200ms of audio
         return ""
 
     try:
@@ -157,7 +157,7 @@ async def transcribe_pcm(pcm_bytes: bytes) -> str:
         with wave.open(wav_buffer, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)      # 16-bit
-            wf.setframerate(MULAW_RATE)
+            wf.setframerate(sample_rate)
             wf.writeframes(pcm_bytes)
         wav_buffer.seek(0)
         wav_buffer.name = "utterance.wav"
@@ -209,6 +209,7 @@ async def get_jarvis_response(session: CallSession, user_text: str) -> str:
             tone="professional",
             channel="voice",
             role=session.role,
+            context_override=ctx_hint
         )
 
     # Run synchronous orchestrator in thread pool — keeps WS loop responsive

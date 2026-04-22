@@ -79,9 +79,9 @@ def split_into_chunks(text: str) -> List[str]:
     return chunks
 
 
-async def synthesise_chunk(text: str) -> bytes:
+async def synthesise_chunk(text: str, output_format: str = "mp3_44100_128") -> bytes:
     """
-    Synthesise a single text chunk to MP3 bytes via ElevenLabs streaming API.
+    Synthesise a single text chunk to audio bytes via ElevenLabs streaming API.
 
     Uses the websocket/streaming endpoint for lowest latency.
     Falls back to an empty bytes object on any failure so the caller can
@@ -102,6 +102,7 @@ async def synthesise_chunk(text: str) -> bytes:
                 text=text,
                 voice=voice_id,
                 model="eleven_turbo_v2",   # Turbo model = lowest latency
+                output_format=output_format,
                 stream=True,
             )
             return b"".join(audio_iter)
@@ -115,9 +116,9 @@ async def synthesise_chunk(text: str) -> bytes:
         return b""
 
 
-async def stream_text_to_speech(text: str) -> AsyncGenerator[bytes, None]:
+async def stream_text_to_speech(text: str, output_format: str = "mp3_44100_128") -> AsyncGenerator[bytes, None]:
     """
-    Async generator that streams MP3 audio chunks for a full response string.
+    Async generator that streams audio chunks for a full response string.
 
     Splits the text into sentence chunks and yields each audio chunk as soon
     as it is synthesised — so playback can start on the first sentence while
@@ -135,7 +136,7 @@ async def stream_text_to_speech(text: str) -> AsyncGenerator[bytes, None]:
     logger.info(f"[TTS] Streaming {len(chunks)} chunks for response ({len(text)} chars)")
 
     for i, chunk in enumerate(chunks):
-        audio = await synthesise_chunk(chunk)
+        audio = await synthesise_chunk(chunk, output_format=output_format)
         if audio:
             logger.debug(f"[TTS] Yielding chunk {i + 1}/{len(chunks)}")
             yield audio
@@ -143,12 +144,12 @@ async def stream_text_to_speech(text: str) -> AsyncGenerator[bytes, None]:
         await asyncio.sleep(0)
 
 
-async def full_text_to_speech(text: str) -> bytes:
+async def full_text_to_speech(text: str, output_format: str = "mp3_44100_128") -> bytes:
     """
     Convenience wrapper that collects all streaming chunks into a single bytes object.
     Used by the batch (/voice/process) endpoint as a faster alternative to pipeline.py.
     """
     parts: List[bytes] = []
-    async for chunk in stream_text_to_speech(text):
+    async for chunk in stream_text_to_speech(text, output_format=output_format):
         parts.append(chunk)
     return b"".join(parts)
