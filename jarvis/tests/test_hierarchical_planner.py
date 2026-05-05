@@ -42,7 +42,7 @@ def print_json(obj, indent=2):
         obj = obj.model_dump()
     print(json.dumps(obj, indent=indent, default=str))
 
-def test_scenario(title: str, user_input: str, context: str = ""):
+def run_test_scenario(title: str, user_input: str, context: str = ""):
     divider(f"TEST SCENARIO: {title}")
     print(f"{BOLD}User Input:{RESET} '{user_input}'\n")
 
@@ -170,20 +170,20 @@ def main():
     critic_node.evaluate_plan = _stub_critic_evaluate
 
     # Scenario 1: Multi-step UI task
-    test_scenario(
+    run_test_scenario(
         "Multi-step UI task",
         "Open Chrome, search YouTube, and play a video"
     )
 
     # Scenario 2: Dependency failure
-    test_scenario(
+    run_test_scenario(
         "Dependency failure",
         "Click search button",
         context="System State: No application is currently open. Desktop is empty."
     )
 
     # Scenario 3: Ambiguous instruction
-    test_scenario(
+    run_test_scenario(
         "Ambiguous instruction",
         "Search something and open the first result"
     )
