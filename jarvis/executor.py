@@ -1,3 +1,4 @@
+from config.settings import settings
 import logging
 import time
 from typing import List, Dict, Any, Optional
